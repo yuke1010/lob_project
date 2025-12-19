@@ -36,3 +36,7 @@ build/
 
 ### Mac OS ###
 .DS_Store
+# outputs
+output.txt
+010*.csv
+010*.csv-r-*
