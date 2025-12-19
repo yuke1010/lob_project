@@ -5,67 +5,73 @@ import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Mapper;
 
 import java.io.IOException;
+import java.util.HashMap;
+import java.util.Map;
 
-// Mapper 输入：<offset, line>
-// Mapper 输出：key = "20241002,093000", value = "f1,f2,...,f20"
-public class FactorMapper extends Mapper<LongWritable, Text, Text, Text> {
+public class FactorMapper extends Mapper<LongWritable, Text, LongWritable, FactorAggWritable> {
 
-    private String currentStock = null;   // 用于跟踪新文件
-    private LobRecord prev = null;        // 前一条记录
+    private LobRecord prev = null;
+    private String curFile = null;
+
+    // in-mapper combine: sortKey -> agg
+    private final HashMap<Long, FactorAggWritable> aggMap = new HashMap<>(200000);
 
     @Override
-    protected void setup(Context context) {
+    protected void setup(Context ctx) {
         prev = null;
+        curFile = null;
+        aggMap.clear();
     }
 
     @Override
-    protected void map(LongWritable key, Text value, Context context)
+    protected void map(LongWritable key, Text value, Context ctx)
             throws IOException, InterruptedException {
 
-        String line = value.toString();
+        // ✅ CombineTextInputFormat 下：同一个 mapper 会读多个文件
+        String file = ctx.getConfiguration().get("mapreduce.map.input.file");
+        if (curFile == null || !curFile.equals(file)) {
+            curFile = file;
+            prev = null; // ⭐必须重置，否则不同股票/不同文件会串起来
+        }
 
-        // 跳过 header 行；所有 snapshot.csv 头都以 tradingDay 开头
+        String line = value.toString();
         if (line.startsWith("tradingDay")) return;
 
         LobRecord cur = LocalCSVParser.parse(line);
         if (cur == null) return;
 
-        // tradeTime 格式 HHMMSS，不带毫秒（你 LocalTest 已验证过）
         long time = cur.tradeTime;
 
-        // 跳过 09:25 之前的行情
-        if (time < 92500) {
-            prev = cur;
-            return;
-        }
+        // 9:25 前：只更新 prev
+        if (time < 92500) { prev = cur; return; }
+        // 9:25~9:30：只更新 prev，不输出
+        if (time < 93000) { prev = cur; return; }
+        // prev 为空：先补 prev
+        if (prev == null) { prev = cur; return; }
 
-        // 09:25～09:30 之间读取 prev，但不输出
-        if (time < 93000) {
-            prev = cur;
-            return;
-        }
-
-        // 必须有 prev 才能计算因子
-        if (prev == null) {
-            prev = cur;
-            return;
-        }
-
-        // 计算 20 因子
         double[] f = FactorCalculator.computeAll(prev, cur);
 
-        // 组装 value 字符串
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < f.length; i++) {
-            if (i > 0) sb.append(',');
-            sb.append(f[i]);
+        long sortKey = cur.tradingDay * 1000000L + cur.tradeTime;
+
+        FactorAggWritable agg = aggMap.get(sortKey);
+        if (agg == null) {
+            agg = new FactorAggWritable();
+            aggMap.put(sortKey, agg);
         }
-
-        // key = "20241002,093000"
-        String mapKey = cur.tradingDay + "," + time;
-
-        context.write(new Text(mapKey), new Text(sb.toString()));
+        agg.add(f);
 
         prev = cur;
+    }
+
+    @Override
+    protected void cleanup(Context ctx) throws IOException, InterruptedException {
+        LongWritable outKey = new LongWritable();
+
+        for (Map.Entry<Long, FactorAggWritable> e : aggMap.entrySet()) {
+            outKey.set(e.getKey());
+            ctx.write(outKey, e.getValue());
+        }
+
+        aggMap.clear();
     }
 }

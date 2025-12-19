@@ -1,41 +1,71 @@
 package lob;
 
+import org.apache.hadoop.io.LongWritable;
+import org.apache.hadoop.io.NullWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Reducer;
+import org.apache.hadoop.mapreduce.lib.output.MultipleOutputs;
 
 import java.io.IOException;
+import java.util.Locale;
 
-public class FactorReducer extends Reducer<Text, Text, Text, Text> {
+public class FactorReducer extends Reducer<LongWritable, FactorAggWritable, NullWritable, Text> {
+
+    private MultipleOutputs<NullWritable, Text> mos;
+
+    private long lastDay = -1;
+
+    private static final String HEADER =
+            "tradeTime,alpha_1,alpha_2,alpha_3,alpha_4,alpha_5,alpha_6,alpha_7,alpha_8,alpha_9,alpha_10," +
+                    "alpha_11,alpha_12,alpha_13,alpha_14,alpha_15,alpha_16,alpha_17,alpha_18,alpha_19,alpha_20";
 
     @Override
-    protected void reduce(Text key, Iterable<Text> values, Context context)
+    protected void setup(Context ctx) {
+        mos = new MultipleOutputs<>(ctx);
+        Locale.setDefault(Locale.US);
+        lastDay = -1;
+    }
+
+    @Override
+    protected void reduce(LongWritable key, Iterable<FactorAggWritable> values, Context ctx)
             throws IOException, InterruptedException {
 
-        final int DIM = 20;
-        double[] sum = new double[DIM];
-        int count = 0;
+        double[] sum = new double[FactorAggWritable.DIM];
+        long count = 0;
 
-        // 累加所有股票的因子值
-        for (Text v : values) {
-            String[] arr = v.toString().split(",");
-            if (arr.length != DIM) continue;   // 保险
-
-            for (int i = 0; i < DIM; i++) {
-                sum[i] += Double.parseDouble(arr[i]);
-            }
-            count++;
+        for (FactorAggWritable v : values) {
+            for (int i = 0; i < FactorAggWritable.DIM; i++) sum[i] += v.sum[i];
+            count += v.count;
         }
 
-        // 如果没有数据，直接跳过
         if (count == 0) return;
 
-        // 求平均
-        StringBuilder sb = new StringBuilder();
-        for (int i = 0; i < DIM; i++) {
-            if (i > 0) sb.append(',');
-            sb.append(sum[i] / count);
+        long ts = key.get();
+        long day = ts / 1000000L;
+        long time = ts % 1000000L;
+
+        String dayStr = String.format("%08d", day);
+        String fileName = dayStr.substring(4) + ".csv"; // 0102.csv
+
+        // ⭐ 每天第一次写表头（强烈建议 Driver 设 1 个 reducer，避免重复表头）
+        if (day != lastDay) {
+            mos.write(NullWritable.get(), new Text(HEADER), fileName);
+            lastDay = day;
         }
 
-        context.write(key, new Text(sb.toString()));
+        StringBuilder sb = new StringBuilder();
+        sb.append(String.format("%06d", time));
+
+        for (int i = 0; i < FactorAggWritable.DIM; i++) {
+            double avg = sum[i] / (double) count;
+            sb.append(',').append(Double.toString(avg));
+        }
+
+        mos.write(NullWritable.get(), new Text(sb.toString()), fileName);
+    }
+
+    @Override
+    protected void cleanup(Context ctx) throws IOException, InterruptedException {
+        mos.close();
     }
 }
