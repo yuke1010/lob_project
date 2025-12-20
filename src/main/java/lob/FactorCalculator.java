@@ -5,8 +5,12 @@ public class FactorCalculator {
     private static final double EPS = 1e-7;
     private static final int N = 5;
 
-    public static double[] computeAll(LobRecord prev, LobRecord cur) {
-        double[] f = new double[20];
+    /**
+     * 优化版计算：结果直接写入 buffer，避免创建新数组
+     */
+    public static void computeAll(LobRecord prev, LobRecord cur, double[] f) {
+        // 确保 buffer 干净 (如果业务逻辑是覆盖写，其实不需要清零，这里为了安全)
+        // 本场景下所有位置都会被重新赋值，所以不需要 Arrays.fill(f, 0)
 
         double ap1 = cur.ap[0];
         double bp1 = cur.bp[0];
@@ -71,7 +75,5 @@ public class FactorCalculator {
         }
 
         f[19] = (ap1 - bp1) / (bidDepth + askDepth + EPS);
-
-        return f;
     }
 }

@@ -15,6 +15,7 @@ public class FactorAggWritable implements Writable {
 
     public FactorAggWritable() {}
 
+    // 原有的方法，保留以防万一
     public void add(double[] f) {
         for (int i = 0; i < DIM; i++) sum[i] += f[i];
         count++;
