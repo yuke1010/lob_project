@@ -3,28 +3,33 @@ package lob;
 import org.apache.hadoop.io.LongWritable;
 import org.apache.hadoop.io.Text;
 import org.apache.hadoop.mapreduce.Mapper;
-
 import java.io.IOException;
 import java.util.HashMap;
 import java.util.Map;
 
 public class FactorMapper extends Mapper<LongWritable, Text, LongWritable, FactorAggWritable> {
 
-    // ⭐ 对象池：只创建两个记录对象，反复使用
+    // 对象池技术
+    // 只创建两个 LobRecord 对象，在处理所有数据行时反复重用
+    // 避免为每行数据创建新对象，极大地减少了GC压力
     private LobRecord prevRecord = new LobRecord();
     private LobRecord curRecord = new LobRecord();
-    private boolean hasPrev = false; // 标记 prevRecord 是否有效
+    private boolean hasPrev = false; // 标记是否已经有了合法的上一笔数据
 
-    // ⭐ 计算缓冲区：避免每次 new double[20]
+    // 预分配计算缓冲区，避免 computeAll内部频繁创建数组。计算出20个因子就把这个数组传进去填满，用完擦除（或覆盖），反复使用
     private final double[] calcBuffer = new double[FactorAggWritable.DIM];
 
+    //记录当前正在处理的文件名，用于检测文件边界
     private String curFile = null;
 
-    // in-mapper combine
+    //Map端内存聚合
+    //在HashMap中缓存聚合结果，而不是每计算一行就context.write一次
+    //大幅减少溢写磁盘 (Spill) 的次数
     private final HashMap<Long, FactorAggWritable> aggMap = new HashMap<>(200000);
 
     @Override
     protected void setup(Context ctx) {
+        //初始化状态
         hasPrev = false;
         curFile = null;
         aggMap.clear();
@@ -34,72 +39,78 @@ public class FactorMapper extends Mapper<LongWritable, Text, LongWritable, Facto
     protected void map(LongWritable key, Text value, Context ctx)
             throws IOException, InterruptedException {
 
+        //获取当前处理的文件名
         String file = ctx.getConfiguration().get("mapreduce.map.input.file");
+        //如果文件切换了（CombineTextInputFormat 可能会合并多个文件到一个 Map 任务）
+        //必须重置hasPrev，因为不同文件的行情是不连续的，不能跨文件计算Diff
         if (curFile == null || !curFile.equals(file)) {
             curFile = file;
-            hasPrev = false; // 文件切换，重置前一笔记录
+            hasPrev = false;
         }
 
         String line = value.toString();
+        //跳过CSV表头
         if (line.startsWith("tradingDay")) return;
 
-        // ⭐ 1. 交换引用：让 cur 变成 prev (准备接收新数据)
-        // 这一步之后，curRecord 指向的是一个"旧对象"，我们可以安全地往里覆写新数据
-        // 而 prevRecord 指向的是上一轮解析好的数据
+        //指针交换Swap
+        //每一轮循环，当前的cur就变成了下一轮的prev。
+        //通过交换引用而不是深拷贝数据，实现了 O(1) 的状态转移。
         if (hasPrev) {
             LobRecord temp = prevRecord;
             prevRecord = curRecord;
             curRecord = temp;
         }
 
-        // ⭐ 2. 零拷贝解析：直接解析到 curRecord 中
+        //调用自定义解析器，直接解析数据到 curRecord 对象中 (零对象创建)
         boolean success = LocalCSVParser.parse(line, curRecord);
         if (!success) return;
 
         long time = curRecord.tradeTime;
 
-        // 9:25 前：只更新状态，不算因子
-        if (time < 92500) {
-            hasPrev = true; // 标记当前这一笔有效，下一轮它就是 prev
-            return;
-        }
-        // 9:25~9:30：同上
+        // 数据过滤
+        // 9:25~9:30之间的数据可以作为下一笔的 prev
         if (time < 93000) {
             hasPrev = true;
             return;
         }
-        // 如果没有前一笔数据 (比如文件第一行就是 9:30:00)，没法算 diff，只能先存着
+        // 如果 9:30:00是文件的第一行，没有前一笔数据无法计算Diff类因子
         if (!hasPrev) {
             hasPrev = true;
             return;
         }
 
-        // ⭐ 3. 零 GC 计算：传入 buffer
-        // 注意：此时 prevRecord 是上一轮的 cur，curRecord 是刚刚解析的
+        //因子计算
+        //此时：prevRecord存的是上一笔有效数据，curRecord是当前数据
+        //计算结果直接填入 calcBuffer
         FactorCalculator.computeAll(prevRecord, curRecord, calcBuffer);
 
+        // 生成聚合Key：TradingDay + TradeTime
+        // 这样同一秒的多笔数据会被聚合在一起
         long sortKey = curRecord.tradingDay * 1000000L + curRecord.tradeTime;
 
+        //内存聚合，使用HashMap agg 缓存结果，在 cleanup 统一输出。
+        //查找当前 Key 是否已有记录，不去立即写磁盘，而是去查 HashMap
         FactorAggWritable agg = aggMap.get(sortKey);
         if (agg == null) {
             agg = new FactorAggWritable();
             aggMap.put(sortKey, agg);
         }
 
-        // agg.add 现在需要支持数组参数
+        //如果这个时间点已经有数据了，将当前计算结果累加到 Map 中
         agg.add(calcBuffer);
-
-        // 注意：不需要再赋值 prev = cur，因为我们在开头已经做了 swap
     }
 
+    //当Map任务处理完所有数据后调用
     @Override
     protected void cleanup(Context ctx) throws IOException, InterruptedException {
         LongWritable outKey = new LongWritable();
 
+        //统一输出HashMap中的所有聚合结果，遍历（sum[20], count）
         for (Map.Entry<Long, FactorAggWritable> e : aggMap.entrySet()) {
             outKey.set(e.getKey());
             ctx.write(outKey, e.getValue());
         }
+        // 释放内存
         aggMap.clear();
     }
 }
